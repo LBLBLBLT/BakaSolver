@@ -518,6 +518,37 @@ TOOLS = [
     },
 ]
 
+# task 工具：仅父 agent 可用，防止递归
+TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": (
+            "将子任务分发给独立的 subagent 执行。subagent 拥有独立上下文，"
+            "适合数据密集型操作（如分析单口井、批量特征提取）。只返回摘要结论。"
+            "使用场景：(1)需要读取大量数据的探索任务 (2)可独立完成的子问题 "
+            "(3)不需要父 agent 看到中间过程的任务。"
+            "prompt 要写清楚：目标、数据文件路径、期望返回什么。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "子任务的完整描述，要包含足够的上下文让 subagent 独立完成"
+                }
+            },
+            "required": ["prompt"]
+        }
+    }
+}
+
+CHILD_TOOLS = TOOLS
+PARENT_TOOLS = CHILD_TOOLS + [TASK_TOOL]
+
+# 向后兼容：外部引用 TOOLS 的地方仍然能工作
+TOOLS = PARENT_TOOLS
+
 # ═══════════════════════════════════════════════════════════
 #  工具分发表
 # ═══════════════════════════════════════════════════════════
@@ -531,7 +562,14 @@ TOOL_HANDLERS = {
     "add_notebook_cell": lambda **kw: run_add_notebook_cell(kw["cell_type"], kw["source"]),
     "todo_write": lambda **kw: run_todo_write(kw["todos"]),
     "list_files": lambda **kw: run_list_files(kw.get("directory", ".")),
+    "task": lambda **kw: _run_task(kw["prompt"]),
 }
+
+
+def _run_task(prompt: str) -> str:
+    """task 工具的 handler，延迟导入避免循环引用。"""
+    from agent import run_subagent
+    return run_subagent(prompt)
 
 
 def dispatch(name: str, arguments: str) -> str:

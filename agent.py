@@ -16,15 +16,16 @@ agent.py - 数学建模 Auto Agent 主入口
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 
 # 确保能 import 同目录模块
 sys.path.insert(0, str(Path(__file__).parent))
 
-from tools import TOOLS, dispatch, CURRENT_TODOS, get_notebook
+from tools import TOOLS, PARENT_TOOLS, CHILD_TOOLS, dispatch, CURRENT_TODOS, get_notebook
 from compaction import prepare_context, reactive_compact, estimate_size
 from prompts import build_system_prompt, build_reminder
 
@@ -33,9 +34,96 @@ load_dotenv(override=True)
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY", ""),
     base_url=os.environ.get("OPENAI_BASE_URL"),
+    max_retries=3,
+    timeout=120.0,
 )
 MODEL = os.environ.get("MODEL_ID", "deepseek-chat")
 SYSTEM_PROMPT = build_system_prompt()
+
+# 重试配置
+MAX_LLM_ATTEMPTS = 3
+
+
+# ═══════════════════════════════════════════════════════════
+#  LLM 调用封装（带重试）
+# ═══════════════════════════════════════════════════════════
+
+def call_llm(system_prompt: str, messages: list, tools: list, max_tokens: int = 4096):
+    """带重试的 LLM 调用。内置 max_retries 处理瞬时错误，这里处理连续失败。"""
+    for attempt in range(MAX_LLM_ATTEMPTS):
+        try:
+            return client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": system_prompt}] + messages,
+                tools=tools,
+                max_tokens=max_tokens,
+            )
+        except (APIConnectionError, APITimeoutError) as e:
+            if attempt < MAX_LLM_ATTEMPTS - 1:
+                wait = 10 * (attempt + 1)
+                print(f"\033[31m[网络错误] {e.__class__.__name__}，{wait}s 后重试 ({attempt+1}/{MAX_LLM_ATTEMPTS})...\033[0m")
+                time.sleep(wait)
+            else:
+                raise
+        except RateLimitError as e:
+            if attempt < MAX_LLM_ATTEMPTS - 1:
+                wait = 30 * (attempt + 1)
+                print(f"\033[31m[限流] {wait}s 后重试 ({attempt+1}/{MAX_LLM_ATTEMPTS})...\033[0m")
+                time.sleep(wait)
+            else:
+                raise
+
+
+# ═══════════════════════════════════════════════════════════
+#  Subagent 运行器（s04 模式）
+# ═══════════════════════════════════════════════════════════
+
+def run_subagent(prompt: str) -> str:
+    """独立上下文执行子任务，只返回摘要文本。不污染父 agent 上下文。"""
+    from prompts import build_subagent_prompt
+    from tools import CHILD_TOOLS, dispatch
+
+    sub_system = build_subagent_prompt()
+    sub_messages = [{"role": "user", "content": prompt}]
+    max_sub_turns = 30
+
+    print(f"\033[35m[subagent 启动] {prompt[:80]}...\033[0m")
+
+    for turn in range(max_sub_turns):
+        response = call_llm(sub_system, sub_messages, CHILD_TOOLS, max_tokens=4096)
+        msg = response.choices[0].message
+
+        assistant_msg = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in msg.tool_calls
+            ]
+        sub_messages.append(assistant_msg)
+
+        if not msg.tool_calls:
+            break
+
+        for tc in msg.tool_calls:
+            func_name = tc.function.name
+            print(f"\033[35m  [sub] > {func_name}\033[0m")
+            result = dispatch(func_name, tc.function.arguments)
+            sub_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result
+            })
+
+    summary = msg.content or "(子任务无输出)"
+    print(f"\033[35m[subagent 完成] 返回 {len(summary)} 字符摘要\033[0m")
+    return summary
 
 # 持久化 todo 文件路径
 TODO_FILE = Path(__file__).parent / "output" / ".agent_todo.json"
@@ -133,12 +221,7 @@ def agent_loop(messages: list):
 
         # 调用模型
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-                tools=TOOLS,
-                max_tokens=4096,
-            )
+            response = call_llm(SYSTEM_PROMPT, messages, PARENT_TOOLS)
             reactive_retries = 0
         except Exception as e:
             err_str = str(e).lower()
@@ -219,6 +302,8 @@ def agent_loop(messages: list):
                 print(f" | {parsed_args.get('cell_type', '')} cell")
             elif func_name == "todo_write":
                 print(" | 更新任务列表")
+            elif func_name == "task":
+                print(f" | 子任务: {parsed_args.get('prompt', '')[:60]}...")
             else:
                 print()
 
@@ -230,6 +315,8 @@ def agent_loop(messages: list):
                 print(f"\033[90m{result[:500]}\033[0m")
             elif func_name == "todo_write":
                 pass  # run_todo_write 内部已经打印了
+            elif func_name == "task":
+                print(f"  \033[35m{result[:300]}\033[0m")
             elif func_name == "python_execute" and len(result) > 200:
                 print(f"  \033[90m{result[:300]}\033[0m")
             else:
