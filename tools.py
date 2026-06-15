@@ -11,6 +11,7 @@ import ast
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import re
 from pathlib import Path
@@ -24,8 +25,32 @@ from notebook_builder import NotebookBuilder
 WORKDIR = Path.cwd()
 DATA_DIR = WORKDIR / "data"
 OUTPUT_DIR = WORKDIR / "output"
+VENV_DIR = WORKDIR / ".venv"
 OUTPUT_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
+
+
+def _get_python() -> str:
+    """返回虚拟环境的 python 路径。首次调用时自动创建 venv 并安装依赖。"""
+    if os.name == "nt":
+        venv_python = VENV_DIR / "Scripts" / "python.exe"
+    else:
+        venv_python = VENV_DIR / "bin" / "python"
+
+    if not venv_python.exists():
+        print("[venv] 创建虚拟环境...")
+        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)],
+                       check=True, capture_output=True)
+        print("[venv] 安装数学建模依赖...")
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "-q",
+             "numpy", "pandas", "scipy", "scikit-learn", "matplotlib"],
+            check=True, capture_output=True
+        )
+        print("[venv] 依赖安装完成。")
+
+    return str(venv_python)
+
 
 CURRENT_TODOS: list[dict] = []
 NOTEBOOK: NotebookBuilder | None = None
@@ -43,15 +68,16 @@ def get_notebook() -> NotebookBuilder:
 # ═══════════════════════════════════════════════════════════
 
 def run_python_execute(code: str) -> str:
-    """执行 Python 代码，捕获输出。自动处理 matplotlib 图片保存。"""
+    """执行 Python 代码，捕获输出。使用虚拟环境确保依赖可用。"""
     code = _patch_matplotlib(code)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
                                       dir=OUTPUT_DIR, encoding="utf-8")
     try:
         tmp.write(code)
         tmp.close()
+        python_bin = _get_python()
         r = subprocess.run(
-            ["python", tmp.name],
+            [python_bin, tmp.name],
             capture_output=True, text=True, timeout=300,
             cwd=str(OUTPUT_DIR),
             env={**os.environ, "MPLBACKEND": "Agg"}
@@ -159,8 +185,9 @@ def run_inspect_data(path: str, sample_rows: int = 5) -> str:
         try:
             tmp.write(code)
             tmp.close()
+            python_bin = _get_python()
             r = subprocess.run(
-                ["python", tmp.name],
+                [python_bin, tmp.name],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(OUTPUT_DIR)
             )

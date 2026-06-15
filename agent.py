@@ -37,6 +37,46 @@ client = OpenAI(
 MODEL = os.environ.get("MODEL_ID", "deepseek-chat")
 SYSTEM_PROMPT = build_system_prompt()
 
+# 持久化 todo 文件路径
+TODO_FILE = Path(__file__).parent / "output" / ".agent_todo.json"
+
+
+# ═══════════════════════════════════════════════════════════
+#  Todo 持久化：跨次执行的任务延续
+# ═══════════════════════════════════════════════════════════
+
+def save_todo():
+    """将当前 todo 列表保存到磁盘。"""
+    from tools import CURRENT_TODOS
+    TODO_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TODO_FILE.write_text(json.dumps(CURRENT_TODOS, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+
+
+def load_todo() -> list[dict] | None:
+    """加载上次未完成的 todo 列表，如果存在且有未完成项。"""
+    if not TODO_FILE.exists():
+        return None
+    try:
+        todos = json.loads(TODO_FILE.read_text(encoding="utf-8"))
+        pending = [t for t in todos if t.get("status") != "completed"]
+        if pending:
+            return todos
+        TODO_FILE.unlink(missing_ok=True)
+        return None
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def format_todo_for_prompt(todos: list[dict]) -> str:
+    """将 todo 列表格式化为注入 prompt 的文本。"""
+    icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+    lines = ["[上次执行未完成，以下是待续任务列表]："]
+    for t in todos:
+        lines.append(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
+    lines.append("\n请从上次中断的位置继续工作。已完成的步骤不要重复。")
+    return "\n".join(lines)
+
 
 # ═══════════════════════════════════════════════════════════
 #  进度输出
@@ -75,6 +115,10 @@ def agent_loop(messages: list):
     max_turns = 80
 
     for turn in range(max_turns):
+        # 每 5 轮自动保存历史（防硬杀丢进度）
+        if turn > 0 and turn % 5 == 0:
+            save_history(messages)
+
         # 打印当前状态
         print_status(turn, len(messages))
 
@@ -140,27 +184,39 @@ def agent_loop(messages: list):
             func_name = tool_call.function.name
             func_args = tool_call.function.arguments
 
+            # 安全解析参数（LLM 可能返回截断的 JSON）
+            try:
+                parsed_args = json.loads(func_args) if isinstance(func_args, str) else func_args
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"\033[36m> {func_name}\033[0m")
+                err_msg = (
+                    f"Error: 工具参数 JSON 解析失败 — {e}\n"
+                    f"原始参数(前200字符): {func_args[:200] if isinstance(func_args, str) else func_args}\n"
+                    f"请重新生成完整的工具调用。"
+                )
+                print(f"  \033[31m{err_msg[:150]}\033[0m")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": err_msg
+                })
+                continue
+
             # 更详细的工具调用日志
             print(f"\033[36m> {func_name}\033[0m", end="")
             if func_name == "python_execute":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                code_preview = args.get("code", "")[:80].replace("\n", " ")
+                code_preview = parsed_args.get("code", "")[:80].replace("\n", " ")
                 print(f" | {code_preview}...")
             elif func_name == "web_search":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                print(f" | query={args.get('query', '')}")
+                print(f" | query={parsed_args.get('query', '')}")
             elif func_name == "inspect_data":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                print(f" | {args.get('path', '')}")
+                print(f" | {parsed_args.get('path', '')}")
             elif func_name == "read_file":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                print(f" | {args.get('path', '')}")
+                print(f" | {parsed_args.get('path', '')}")
             elif func_name == "list_files":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                print(f" | {args.get('directory', '.')}")
+                print(f" | {parsed_args.get('directory', '.')}")
             elif func_name == "add_notebook_cell":
-                args = json.loads(func_args) if isinstance(func_args, str) else func_args
-                print(f" | {args.get('cell_type', '')} cell")
+                print(f" | {parsed_args.get('cell_type', '')} cell")
             elif func_name == "todo_write":
                 print(" | 更新任务列表")
             else:
@@ -189,6 +245,7 @@ def agent_loop(messages: list):
             # 重置 todo 计数器
             if func_name == "todo_write":
                 rounds_since_todo = 0
+                save_todo()
 
     print("\n[警告] 达到最大轮次限制，Agent 停止。")
 
@@ -196,6 +253,38 @@ def agent_loop(messages: list):
 # ═══════════════════════════════════════════════════════════
 #  入口：从 Markdown 文件读取题目
 # ═══════════════════════════════════════════════════════════
+
+HISTORY_FILE = Path(__file__).parent / "output" / ".history.json"
+
+
+def save_history(messages: list):
+    """持久化对话历史到磁盘，用于崩溃恢复。"""
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(
+        json.dumps(messages, default=str, ensure_ascii=False, indent=1),
+        encoding="utf-8"
+    )
+    print(f"\033[90m[历史已保存: {HISTORY_FILE}]\033[0m")
+
+
+def load_history() -> list | None:
+    """尝试加载上次崩溃保存的历史记录。"""
+    if not HISTORY_FILE.exists():
+        return None
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list) and len(data) > 0:
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def clear_history():
+    """正常结束后清理历史文件。"""
+    if HISTORY_FILE.exists():
+        HISTORY_FILE.unlink()
+
 
 PROBLEM_FILE = "problem.md"
 
@@ -220,7 +309,12 @@ def load_problem(path: str = None) -> str:
 
 def main():
     # 支持命令行指定题目文件，默认 problem.md
-    problem_path = sys.argv[1] if len(sys.argv) > 1 else None
+    # 特殊参数 --resume 从崩溃历史恢复
+    args = sys.argv[1:]
+    resume_mode = "--resume" in args
+    if resume_mode:
+        args.remove("--resume")
+    problem_path = args[0] if args else None
     problem = load_problem(problem_path)
 
     print("=" * 50)
@@ -232,10 +326,57 @@ def main():
     print("-" * 50)
     print(problem[:200] + ("..." if len(problem) > 200 else ""))
     print("-" * 50)
+
+    # 尝试从崩溃历史恢复
+    history = None
+    if resume_mode:
+        history = load_history()
+        if history:
+            print(f"\n\033[33m[恢复模式] 从上次中断处继续，已有 {len(history)} 条消息\033[0m")
+        else:
+            # 没有完整历史，但可能有 todo 可续做
+            prev_todos = load_todo()
+            if prev_todos:
+                print(f"\n\033[33m[续做模式] 从上次任务列表继续：\033[0m")
+                icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+                for t in prev_todos:
+                    print(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
+                import tools
+                tools.CURRENT_TODOS = prev_todos
+                continuation = format_todo_for_prompt(prev_todos)
+                history = [
+                    {"role": "user", "content": f"请完成以下数学建模题目：\n\n{problem}"},
+                    {"role": "user", "content": continuation}
+                ]
+            else:
+                print(f"\n\033[33m[恢复模式] 未找到历史记录，从头开始\033[0m")
+    elif load_history() or load_todo():
+        print(f"\n\033[33m[提示] 检测到上次未完成的记录，使用 --resume 可恢复：")
+        print(f"  python agent.py --resume\033[0m")
+
+    if not history:
+        history = [{"role": "user", "content": f"请完成以下数学建模题目：\n\n{problem}"}]
+
     print("\nAgent 开始工作...\n")
 
-    history = [{"role": "user", "content": f"请完成以下数学建模题目：\n\n{problem}"}]
-    agent_loop(history)
+    try:
+        agent_loop(history)
+        clear_history()
+        # 检查是否全部完成
+        from tools import CURRENT_TODOS
+        if CURRENT_TODOS and all(t["status"] == "completed" for t in CURRENT_TODOS):
+            TODO_FILE.unlink(missing_ok=True)
+    except KeyboardInterrupt:
+        print("\n\n\033[33m[中断] 用户手动停止\033[0m")
+        save_history(history)
+        save_todo()
+        print("下次使用 --resume 可继续：python agent.py --resume")
+    except Exception as e:
+        print(f"\n\n\033[31m[异常退出] {type(e).__name__}: {e}\033[0m")
+        save_history(history)
+        save_todo()
+        print("下次使用 --resume 可从中断处继续：python agent.py --resume")
+        raise
 
     # 保存 notebook
     from tools import NOTEBOOK
