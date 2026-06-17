@@ -19,12 +19,27 @@ import sys
 import time
 from pathlib import Path
 
+# Windows 终端 UTF-8 输出
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    os.system("chcp 65001 >nul 2>&1")
+
 from dotenv import load_dotenv
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 
 # 确保能 import 同目录模块
 sys.path.insert(0, str(Path(__file__).parent))
 
+from config import (
+    LLM_MAX_RETRIES,
+    LLM_TIMEOUT,
+    LLM_MAX_ATTEMPTS,
+    LLM_MAX_TOKENS,
+    AGENT_MAX_TURNS,
+    SUBAGENT_MAX_TURNS,
+    SUBAGENT_CONCURRENCY,
+)
 from tools import TOOLS, PARENT_TOOLS, CHILD_TOOLS, dispatch, CURRENT_TODOS, get_notebook
 from compaction import prepare_context, reactive_compact, estimate_size
 from prompts import build_system_prompt, build_reminder
@@ -34,27 +49,62 @@ load_dotenv(override=True)
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY", ""),
     base_url=os.environ.get("OPENAI_BASE_URL"),
-    max_retries=3,
-    timeout=120.0,
+    max_retries=LLM_MAX_RETRIES,
+    timeout=LLM_TIMEOUT,
 )
 MODEL = os.environ.get("MODEL_ID", "deepseek-chat")
 SYSTEM_PROMPT = build_system_prompt()
 
 # 重试配置
-MAX_LLM_ATTEMPTS = 3
+MAX_LLM_ATTEMPTS = LLM_MAX_ATTEMPTS
 
 
 # ═══════════════════════════════════════════════════════════
 #  LLM 调用封装（带重试）
 # ═══════════════════════════════════════════════════════════
 
-def call_llm(system_prompt: str, messages: list, tools: list, max_tokens: int = 4096):
+def _repair_messages(messages: list) -> list:
+    """修复消息完整性：确保每个 assistant(tool_calls) 后紧跟对应的 tool 消息。"""
+    repaired = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        repaired.append(msg)
+
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+            expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+            found_ids = set()
+            j = i + 1
+            while j < len(messages) and isinstance(messages[j], dict) and messages[j].get("role") == "tool":
+                found_ids.add(messages[j].get("tool_call_id"))
+                j += 1
+
+            missing_ids = expected_ids - found_ids
+            if missing_ids:
+                for k in range(i + 1, j):
+                    repaired.append(messages[k])
+                for tid in missing_ids:
+                    repaired.append({
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": "[结果已在上下文压缩时丢失]"
+                    })
+                i = j
+                continue
+
+        i += 1
+    return repaired
+
+
+def call_llm(system_prompt: str, messages: list, tools: list, max_tokens: int = LLM_MAX_TOKENS):
     """带重试的 LLM 调用。内置 max_retries 处理瞬时错误，这里处理连续失败。"""
+    clean_messages = _repair_messages(messages)
+
     for attempt in range(MAX_LLM_ATTEMPTS):
         try:
             return client.chat.completions.create(
                 model=MODEL,
-                messages=[{"role": "system", "content": system_prompt}] + messages,
+                messages=[{"role": "system", "content": system_prompt}] + clean_messages,
                 tools=tools,
                 max_tokens=max_tokens,
             )
@@ -85,7 +135,7 @@ def run_subagent(prompt: str) -> str:
 
     sub_system = build_subagent_prompt()
     sub_messages = [{"role": "user", "content": prompt}]
-    max_sub_turns = 30
+    max_sub_turns = SUBAGENT_MAX_TURNS
 
     print(f"\033[35m[subagent 启动] {prompt[:80]}...\033[0m")
 
@@ -124,6 +174,39 @@ def run_subagent(prompt: str) -> str:
     summary = msg.content or "(子任务无输出)"
     print(f"\033[35m[subagent 完成] 返回 {len(summary)} 字符摘要\033[0m")
     return summary
+
+
+def run_parallel_subagents(prompts: list) -> str:
+    """并发执行多个 subagent，并发数受 SUBAGENT_CONCURRENCY 限制。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    prompts = [p for p in prompts if p and str(p).strip()]
+    if not prompts:
+        return "(parallel_tasks: 未提供有效的子任务)"
+
+    workers = min(SUBAGENT_CONCURRENCY, len(prompts))
+    print(f"\033[35m[parallel] 启动 {len(prompts)} 个子任务，并发数={workers}\033[0m")
+
+    results: list = [None] * len(prompts)
+
+    def _run_one(idx: int, p: str):
+        try:
+            return idx, run_subagent(f"[子任务 #{idx+1}] {p}")
+        except Exception as e:
+            return idx, f"(子任务 #{idx+1} 执行失败: {e})"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_run_one, i, p) for i, p in enumerate(prompts)]
+        for fut in futures:
+            idx, summary = fut.result()
+            results[idx] = summary
+
+    parts = [f"=== 子任务 #{i+1} 结果 ===\n{r}" for i, r in enumerate(results)]
+    print(f"\033[35m[parallel] {len(prompts)} 个子任务全部完成\033[0m")
+    return "\n\n".join(parts)
+
 
 # 持久化 todo 文件路径
 TODO_FILE = Path(__file__).parent / "output" / ".agent_todo.json"
@@ -200,7 +283,7 @@ def agent_loop(messages: list):
     """
     rounds_since_todo = 0
     reactive_retries = 0
-    max_turns = 80
+    max_turns = AGENT_MAX_TURNS
 
     for turn in range(max_turns):
         # 每 5 轮自动保存历史（防硬杀丢进度）
@@ -420,6 +503,13 @@ def main():
         history = load_history()
         if history:
             print(f"\n\033[33m[恢复模式] 从上次中断处继续，已有 {len(history)} 条消息\033[0m")
+            # 恢复 notebook
+            nb_file = Path(__file__).parent / "output" / "modeling.ipynb"
+            if nb_file.exists():
+                import tools
+                from notebook_builder import NotebookBuilder
+                tools.NOTEBOOK = NotebookBuilder.load(str(nb_file))
+                print(f"\033[33m[续做] 已加载现有 notebook：{tools.NOTEBOOK.get_cell_count()} cells\033[0m")
         else:
             # 没有完整历史，但可能有 todo 可续做
             prev_todos = load_todo()
@@ -430,6 +520,14 @@ def main():
                     print(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
                 import tools
                 tools.CURRENT_TODOS = prev_todos
+
+                # 恢复 notebook：从已有 modeling.ipynb 加载，使新 cell 追加而非覆盖
+                nb_file = Path(__file__).parent / "output" / "modeling.ipynb"
+                if nb_file.exists():
+                    from notebook_builder import NotebookBuilder
+                    tools.NOTEBOOK = NotebookBuilder.load(str(nb_file))
+                    print(f"\033[33m[续做] 已加载现有 notebook：{tools.NOTEBOOK.get_cell_count()} cells\033[0m")
+
                 continuation = format_todo_for_prompt(prev_todos)
                 history = [
                     {"role": "user", "content": f"请完成以下数学建模题目：\n\n{problem}"},

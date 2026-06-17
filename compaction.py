@@ -20,11 +20,14 @@ import json
 import time
 from pathlib import Path
 
-
-CONTEXT_LIMIT = 60000
-KEEP_RECENT_TOOLS = 4
-PERSIST_THRESHOLD = 20000
-MAX_MESSAGES = 60
+from config import (
+    CONTEXT_LIMIT,
+    KEEP_RECENT_TOOLS,
+    PERSIST_THRESHOLD,
+    MAX_MESSAGES,
+    COMPACT_SUMMARY_TOKENS,
+    REACTIVE_SUMMARY_TOKENS,
+)
 
 TRANSCRIPT_DIR = Path.cwd() / "output" / ".transcripts"
 PERSIST_DIR = Path.cwd() / "output" / ".tool_outputs"
@@ -165,23 +168,32 @@ def compact_history(messages: list, client, model: str) -> list:
         "请摘要以下数学建模 Agent 的对话历史，以便工作可以继续。\n"
         "必须保留：1.当前建模目标 2.已完成的步骤和关键发现 "
         "3.已读取/生成的文件 4.剩余工作 5.用户约束条件\n"
+        "重点：明确标注哪些步骤已经完成、得出了什么具体结论/数值，"
+        "后续 Agent 不应重复已完成的工作。\n"
+        "注意：你只需要输出纯文本摘要，不要生成任何 tool_calls、XML标签或代码调用。\n"
         "简洁但具体。\n\n" + conversation
     )
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000
+        max_tokens=COMPACT_SUMMARY_TOKENS
     )
     summary = response.choices[0].message.content or "(空摘要)"
 
-    # 输出摘要让用户可见
     print("\n" + "=" * 50)
     print("  [上下文压缩] 以下是当前进度摘要：")
     print("-" * 50)
     print(summary)
     print("=" * 50 + "\n")
 
-    return [{"role": "user", "content": f"[上下文已压缩]\n\n{summary}"}]
+    result = [{"role": "user", "content": f"[上下文已压缩]\n\n{summary}"}]
+    todo_state = _get_current_todo_text()
+    if todo_state:
+        result.append({"role": "user", "content": todo_state})
+    nb_manifest = _get_notebook_manifest_text()
+    if nb_manifest:
+        result.append({"role": "user", "content": nb_manifest})
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -199,11 +211,10 @@ def reactive_compact(messages: list, client, model: str) -> list:
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1500
+        max_tokens=REACTIVE_SUMMARY_TOKENS
     )
     summary = response.choices[0].message.content or "(空摘要)"
 
-    # 输出摘要让用户可见
     print("\n" + "=" * 50)
     print("  [紧急压缩] 上下文超限，以下是保留的摘要：")
     print("-" * 50)
@@ -211,11 +222,119 @@ def reactive_compact(messages: list, client, model: str) -> list:
     print("=" * 50 + "\n")
 
     tail_start = max(0, len(messages) - 6)
-    # 配对保护
     if tail_start > 0 and _is_tool_message(messages[tail_start]):
         tail_start -= 1
 
-    return [{"role": "user", "content": f"[紧急压缩]\n\n{summary}"}] + messages[tail_start:]
+    result = [{"role": "user", "content": f"[紧急压缩]\n\n{summary}"}]
+    todo_state = _get_current_todo_text()
+    if todo_state:
+        result.append({"role": "user", "content": todo_state})
+    nb_manifest = _get_notebook_manifest_text()
+    if nb_manifest:
+        result.append({"role": "user", "content": nb_manifest})
+    return result + messages[tail_start:]
+
+
+def _get_current_todo_text() -> str | None:
+    """获取当前 todo 状态文本，用于压缩后重新注入。"""
+    try:
+        from tools import CURRENT_TODOS
+        if not CURRENT_TODOS:
+            return None
+        icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        lines = [
+            "[重要：以下是你当前的任务进度，不要重复已完成的工作，从当前进行中的任务继续]：",
+        ]
+        for t in CURRENT_TODOS:
+            lines.append(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
+        lines.append("\n严格从 [>] 标记的任务继续执行，已完成的步骤不要重复。")
+        return "\n".join(lines)
+    except ImportError:
+        return None
+
+
+def _get_notebook_manifest_text() -> str | None:
+    """获取已记录到 notebook 的真实步骤清单，压缩后注入，防止遗忘/重复/编造。"""
+    try:
+        from tools import _read_manifest
+        manifest = _read_manifest()
+        if not manifest:
+            return None
+        lines = [
+            "[以下是已经真实执行并记录进 notebook 的代码步骤（cell 顺序）。"
+            "这些步骤已完成且产出已落盘，不要重复执行，也不要在 notebook 里重写它们]：",
+        ]
+        for i, entry in enumerate(manifest):
+            note = entry.get("note") or "(无说明)"
+            preview = (entry.get("code_preview") or "").replace("\n", " ")[:80]
+            lines.append(f"  cell[{entry.get('cell_index', '?')}] {note} | 代码: {preview}...")
+        lines.append("\n后续新步骤继续用 python_execute(record_to_notebook=true) 追加记录。")
+        return "\n".join(lines)
+    except (ImportError, Exception):
+        return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  配对修复：确保 tool_calls 和 tool 响应一一对应
+# ═══════════════════════════════════════════════════════════
+
+def repair_tool_pairs(messages: list) -> list:
+    """修复压缩后可能产生的 tool_calls/tool 不配对问题。"""
+    result = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        if _has_tool_calls(msg):
+            result.append(msg)
+            if isinstance(msg, dict):
+                tc_ids = [tc["id"] for tc in msg.get("tool_calls", [])]
+            else:
+                tc_ids = [tc.id for tc in (msg.tool_calls or [])]
+
+            needed = set(tc_ids)
+            found = set()
+            j = i + 1
+
+            while j < len(messages) and _is_tool_message(messages[j]):
+                tool_msg = messages[j]
+                tid = tool_msg.get("tool_call_id") if isinstance(tool_msg, dict) else getattr(tool_msg, "tool_call_id", None)
+                if tid in needed:
+                    result.append(tool_msg)
+                    found.add(tid)
+                j += 1
+
+            for tid in tc_ids:
+                if tid not in found:
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": "[工具响应在上下文压缩中丢失，请重新执行该工具调用]"
+                    })
+
+            i = j
+        elif _is_tool_message(msg):
+            tid = msg.get("tool_call_id") if isinstance(msg, dict) else getattr(msg, "tool_call_id", None)
+            has_parent = False
+            for prev in reversed(result):
+                if _has_tool_calls(prev):
+                    if isinstance(prev, dict):
+                        parent_ids = [tc["id"] for tc in prev.get("tool_calls", [])]
+                    else:
+                        parent_ids = [tc.id for tc in (prev.tool_calls or [])]
+                    if tid in parent_ids:
+                        has_parent = True
+                    break
+                elif not _is_tool_message(prev):
+                    break
+            if has_parent:
+                result.append(msg)
+            i += 1
+        else:
+            result.append(msg)
+            i += 1
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -231,5 +350,8 @@ def prepare_context(messages: list, client=None, model: str = "") -> list:
     if client and estimate_size(messages) > CONTEXT_LIMIT:
         print("[auto compact] 上下文过大，正在生成摘要...")
         messages[:] = compact_history(messages, client, model)
+
+    # 最终修复：确保 tool_calls 和 tool 消息配对完整
+    messages[:] = repair_tool_pairs(messages)
 
     return messages

@@ -41,8 +41,53 @@ class NotebookBuilder:
             cell["outputs"] = []
         return cell
 
+    @classmethod
+    def load(cls, path: str) -> "NotebookBuilder":
+        """从已有的 .ipynb 文件恢复 builder，使后续 cell 追加而非覆盖。
+
+        进程重启（续做模式）时调用，避免第一次 save() 把上次运行积累的
+        cell 全部冲掉。文件不存在或解析失败时返回一个全新 builder。
+        """
+        p = Path(path)
+        if not p.exists():
+            return cls()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return cls()
+
+        builder = cls.__new__(cls)
+        builder.notebook = data
+        builder.notebook.setdefault("cells", [])
+        existing_counts = [
+            c.get("execution_count") or 0
+            for c in builder.notebook["cells"]
+            if c.get("cell_type") == "code"
+        ]
+        builder._cell_counter = max(
+            [len(builder.notebook["cells"])] + existing_counts
+        )
+        return builder
+
     def add_code_cell(self, source: str) -> int:
         cell = self._make_cell("code", source)
+        self.notebook["cells"].append(cell)
+        return len(self.notebook["cells"]) - 1
+
+    def add_code_cell_with_output(self, source: str, stdout_text: str = "") -> int:
+        """追加一个带真实 stdout 输出的 code cell。
+
+        stdout_text 作为 nbformat stream output 嵌入，
+        这样打开 notebook 就能看到代码的真实运行结果。
+        """
+        cell = self._make_cell("code", source)
+        cell["execution_count"] = self._cell_counter
+        if stdout_text:
+            cell["outputs"] = [{
+                "output_type": "stream",
+                "name": "stdout",
+                "text": stdout_text.splitlines(keepends=True),
+            }]
         self.notebook["cells"].append(cell)
         return len(self.notebook["cells"]) - 1
 
@@ -57,5 +102,6 @@ class NotebookBuilder:
     def save(self, path: str) -> str:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.notebook, ensure_ascii=False, indent=1))
+        p.write_text(json.dumps(self.notebook, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
         return f"Notebook saved: {p} ({self.get_cell_count()} cells)"

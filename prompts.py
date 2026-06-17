@@ -28,11 +28,12 @@ WORKFLOW = """## 工作流程（严格按阶段执行）
 5. **模型评估** — 计算评估指标（R², RMSE, AIC 等），做灵敏度分析或交叉验证。
 6. **报告生成** — 汇总为 Markdown 报告，含 LaTeX 公式、结论和建议。
 
-每个阶段的代码和分析都要通过 add_notebook_cell 写入 Notebook。"""
+每个阶段的实质性代码都必须通过 python_execute(record_to_notebook=true) 真实跑过并自动记录进 Notebook。
+纯说明性文字（背景、公式推导、结论）才用 add_notebook_cell 写 markdown。"""
 
 OUTPUT_FORMAT = """## 输出规范
 
-- **Notebook**：所有代码和分析过程写入 output/modeling.ipynb
+- **Notebook**：所有实质代码通过 python_execute(record_to_notebook=true) 真实执行后自动写入 output/modeling.ipynb；纯说明文字用 add_notebook_cell 写 markdown
 - **报告**：最终生成 output/report.md，使用 Markdown + LaTeX 公式
 - **LaTeX 公式**：行内用 $...$，独立公式用 $$...$$
 - **图片**：matplotlib 图片自动保存到 output/ 目录
@@ -53,20 +54,43 @@ RULES = """## 行为准则
 
 - 开始前必须先用 todo_write 规划全部步骤
 - 每完成一个步骤，更新 todo 状态
-- 代码要先通过 python_execute 验证能运行，再写入 Notebook
-- 遇到错误时分析原因并修复，不要跳过
+- **绝对不要重复已完成的工作**：如果 todo 显示某步骤已完成 [x]，直接跳过进入下一步
+- **不要重新探索已知信息**：如果摘要中已包含数据结构、文件列表等信息，直接使用，不要重新 list_files/read_file
+
+## 执行即记录（最重要的铁律）
+
+- 任何数据清洗、特征工程、建模、评估、生成预测的代码，**必须**通过
+  `python_execute(record_to_notebook=true, cell_note="这一步在做什么")` 执行。
+  执行成功后，实际跑过的代码和真实输出会自动写进 notebook，保证 notebook 真实反映你的操作。
+- **严禁用 add_notebook_cell 写没有真实跑过的代码**。尤其禁止编造占位结果，
+  例如 `cv_scores = {0.179, ...}` 这种硬编码假数值，或引用根本不存在的文件
+  （如 `../data/train.csv`）。notebook 里的每段代码都必须是真实执行过的。
+- add_notebook_cell 仅用于纯说明性 markdown（背景、模型假设、公式推导、结论文字）。
+- 报告里引用的任何数值（RMSE、特征重要性、统计量等）**必须**来自真实执行的输出，不得编造。
+- 如果某步骤已在 notebook manifest 清单里出现，说明它已真实记录，不要重复执行或重写。
+
+## 其他
+
+- 代码要先确保能运行（execute 成功无 Error），失败时分析原因并修复，不要跳过
 - 数据量大时注意内存，使用分块读取
 - 选择模型时说明理由（为什么选这个模型而不是其他）
 
-## 子任务分发（task 工具）
+## 子任务分发（task / parallel_tasks 工具）
 
-当遇到以下情况时，应使用 task 工具将子任务分发给 subagent：
+当遇到以下情况时，应使用 task 工具将单个子任务分发给 subagent：
 - 需要读取/分析大量数据文件的探索任务（如分析单口井的全部特征）
 - 可独立完成的子问题，不需要你看到中间过程
-- 批量重复操作（如对多口井做相同的特征提取）
 
-使用 task 时，prompt 要写清楚：目标是什么、需要用到哪些数据文件、期望返回什么结论。
-subagent 会在独立上下文中执行并只返回摘要结论，不会污染你的上下文。"""
+当有**多个彼此独立、无先后依赖**的子任务时，用 parallel_tasks 一次性并发分发，
+显著加快进度。典型场景：
+- 同时对多口井做相同的特征提取（每口井一个子任务）
+- 并行探索多个数据文件 / 并行训练多个候选模型
+
+parallel_tasks 接收 prompts 数组，每个元素是一个独立子任务描述；并发数受配置限制，
+超出的自动排队。注意：仅用于互相独立的任务，有依赖关系的请用单个 task 依次执行。
+
+使用 task / parallel_tasks 时，每个 prompt 都要写清楚：目标是什么、需要用到哪些数据文件、
+期望返回什么结论。subagent 在独立上下文中执行并只返回摘要结论，不会污染你的上下文。"""
 
 
 def build_system_prompt() -> str:

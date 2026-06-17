@@ -12,11 +12,18 @@ import json
 import os
 import subprocess
 import sys
+import time
+import threading
 import tempfile
 import re
 from pathlib import Path
 
 from notebook_builder import NotebookBuilder
+from config import (
+    PYEXEC_DEFAULT_TIMEOUT,
+    PYEXEC_MAX_TIMEOUT,
+    SUBAGENT_CONCURRENCY,
+)
 
 # ═══════════════════════════════════════════════════════════
 #  全局状态
@@ -55,6 +62,36 @@ def _get_python() -> str:
 CURRENT_TODOS: list[dict] = []
 NOTEBOOK: NotebookBuilder | None = None
 
+# notebook 执行清单：记录哪些步骤的真实代码已经写进 notebook
+MANIFEST_FILE = OUTPUT_DIR / ".notebook_manifest.json"
+
+# 并发锁：保护共享状态（notebook / manifest / todo），防止并发 subagent 写竞争
+_STATE_LOCK = threading.RLock()
+
+
+def _read_manifest() -> list[dict]:
+    """读取 notebook 执行清单。"""
+    if not MANIFEST_FILE.exists():
+        return []
+    try:
+        return json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _append_manifest(entry: dict) -> None:
+    """向 notebook 执行清单追加一条记录。"""
+    with _STATE_LOCK:
+        manifest = _read_manifest()
+        manifest.append(entry)
+        try:
+            MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MANIFEST_FILE.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
 
 def get_notebook() -> NotebookBuilder:
     global NOTEBOOK
@@ -67,29 +104,67 @@ def get_notebook() -> NotebookBuilder:
 #  工具实现
 # ═══════════════════════════════════════════════════════════
 
-def run_python_execute(code: str) -> str:
-    """执行 Python 代码，捕获输出。使用虚拟环境确保依赖可用。"""
-    code = _patch_matplotlib(code)
+def run_python_execute(code: str, timeout: int = PYEXEC_DEFAULT_TIMEOUT,
+                       record_to_notebook: bool = False,
+                       cell_note: str = "") -> str:
+    """执行 Python 代码，捕获输出。使用虚拟环境确保依赖可用。
+
+    record_to_notebook=True 且执行成功时，会把实际执行的代码+真实输出
+    写入 notebook，保证 notebook 内容与真实运行一致。
+    cell_note 为可选的 markdown 说明，记录在代码 cell 之前。
+    """
+    timeout = min(max(timeout, 30), PYEXEC_MAX_TIMEOUT)
+    executed_code = _patch_matplotlib(code)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
                                       dir=OUTPUT_DIR, encoding="utf-8")
     try:
-        tmp.write(code)
+        tmp.write(executed_code)
         tmp.close()
         python_bin = _get_python()
         r = subprocess.run(
             [python_bin, tmp.name],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=timeout,
             cwd=str(OUTPUT_DIR),
             env={**os.environ, "MPLBACKEND": "Agg"}
         )
         out = (r.stdout + r.stderr).strip()
+        success = (r.returncode == 0)
+
+        if record_to_notebook and success:
+            note = _record_execution_to_notebook(executed_code, out, cell_note)
+            tail = f"\n\n[已记录到 notebook] {note}"
+            return (out[:30000] if out else "(执行完成，无输出)") + tail
+
+        if record_to_notebook and not success:
+            return (out[:30000] if out else "(执行失败，无输出)") + \
+                "\n\n[未记录到 notebook：执行失败，请先修复错误再记录]"
+
         return out[:30000] if out else "(执行完成，无输出)"
     except subprocess.TimeoutExpired:
-        return "Error: 执行超时 (300s)"
+        return f"Error: 执行超时 ({timeout}s)。如果是模型训练/调参任务，请设置更大的 timeout（最大{PYEXEC_MAX_TIMEOUT}）。"
     except Exception as e:
         return f"Error: {e}"
     finally:
         os.unlink(tmp.name)
+
+
+def _record_execution_to_notebook(code: str, stdout_text: str, cell_note: str) -> str:
+    """把已成功执行的代码和真实输出写入 notebook，并追加 manifest 记录。"""
+    with _STATE_LOCK:
+        nb = get_notebook()
+        if cell_note:
+            nb.add_markdown_cell(cell_note)
+        idx = nb.add_code_cell_with_output(code, stdout_text[:30000])
+        nb.save(str(OUTPUT_DIR / "modeling.ipynb"))
+        _append_manifest({
+            "cell_index": idx,
+            "note": cell_note,
+            "code_preview": code[:200],
+            "output_preview": stdout_text[:200],
+            "ran_ok": True,
+            "ts": time.time(),
+        })
+        return f"cell index={idx}，当前共 {nb.get_cell_count()} cells"
 
 
 def _patch_matplotlib(code: str) -> str:
@@ -320,13 +395,14 @@ def run_write_file(path: str, content: str) -> str:
 
 def run_add_notebook_cell(cell_type: str, source: str) -> str:
     """向 Notebook 追加一个 cell。"""
-    nb = get_notebook()
-    if cell_type == "code":
-        idx = nb.add_code_cell(source)
-    else:
-        idx = nb.add_markdown_cell(source)
-    nb.save(str(OUTPUT_DIR / "modeling.ipynb"))
-    return f"已追加 {cell_type} cell (index={idx})，当前共 {nb.get_cell_count()} cells"
+    with _STATE_LOCK:
+        nb = get_notebook()
+        if cell_type == "code":
+            idx = nb.add_code_cell(source)
+        else:
+            idx = nb.add_markdown_cell(source)
+        nb.save(str(OUTPUT_DIR / "modeling.ipynb"))
+        return f"已追加 {cell_type} cell (index={idx})，当前共 {nb.get_cell_count()} cells"
 
 
 def run_todo_write(todos: list) -> str:
@@ -350,12 +426,13 @@ def run_todo_write(todos: list) -> str:
         if t["status"] not in ("pending", "in_progress", "completed"):
             return f"Error: todos[{i}] status 无效"
     CURRENT_TODOS = todos
-    lines = ["\n== 当前任务 =="]
-    icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-    for t in CURRENT_TODOS:
-        lines.append(f"  {icons[t['status']]} {t['content']}")
-    print("\n".join(lines))
-    return f"已更新 {len(CURRENT_TODOS)} 个任务"
+    with _STATE_LOCK:
+        lines = ["\n== 当前任务 =="]
+        icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        for t in CURRENT_TODOS:
+            lines.append(f"  {icons[t['status']]} {t['content']}")
+        print("\n".join(lines))
+        return f"已更新 {len(CURRENT_TODOS)} 个任务"
 
 
 def run_list_files(directory: str = ".") -> str:
@@ -392,11 +469,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "python_execute",
-            "description": "执行 Python 代码。用于数据分析、建模、绘图等。代码在 output/ 目录下运行。",
+            "description": "执行 Python 代码。用于数据分析、建模、绘图等。代码在 output/ 目录下运行。对于模型训练、超参数调优等耗时任务，请设置较大的 timeout。\n重要：任何实质性步骤（数据清洗、特征工程、建模、评估、生成预测）都应设 record_to_notebook=true，这样实际跑过的代码和真实输出会自动写入 notebook，保证 notebook 真实反映你的操作。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "要执行的 Python 代码"}
+                    "code": {"type": "string", "description": "要执行的 Python 代码"},
+                    "timeout": {"type": "integer", "description": f"超时秒数，默认{PYEXEC_DEFAULT_TIMEOUT}。模型训练/调参建议设置更大（上限{PYEXEC_MAX_TIMEOUT}）。", "default": PYEXEC_DEFAULT_TIMEOUT},
+                    "record_to_notebook": {"type": "boolean", "description": "执行成功后是否把这段真实代码+输出写入 notebook。实质性分析步骤应设为 true。", "default": False},
+                    "cell_note": {"type": "string", "description": "可选的 markdown 说明，记录在代码 cell 之前，描述这一步在做什么。", "default": ""}
                 },
                 "required": ["code"]
             }
@@ -543,8 +623,32 @@ TASK_TOOL = {
     }
 }
 
+PARALLEL_TASKS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "parallel_tasks",
+        "description": (
+            "并发分发多个独立子任务给多个 subagent 同时执行（并发数受配置限制，超出自动排队）。"
+            "适合批量、彼此独立的任务，如同时对多口井做相同的特征提取、并行探索多个数据文件。"
+            "每个子任务在独立上下文执行，只返回摘要。比逐个 task 调用快得多。"
+            "注意：仅用于互相独立、无依赖的任务；有先后依赖的请用单个 task。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "子任务描述列表，每个元素是一个独立子任务的完整描述（含目标、数据路径、期望返回）"
+                }
+            },
+            "required": ["prompts"]
+        }
+    }
+}
+
 CHILD_TOOLS = TOOLS
-PARENT_TOOLS = CHILD_TOOLS + [TASK_TOOL]
+PARENT_TOOLS = CHILD_TOOLS + [TASK_TOOL, PARALLEL_TASKS_TOOL]
 
 # 向后兼容：外部引用 TOOLS 的地方仍然能工作
 TOOLS = PARENT_TOOLS
@@ -554,7 +658,9 @@ TOOLS = PARENT_TOOLS
 # ═══════════════════════════════════════════════════════════
 
 TOOL_HANDLERS = {
-    "python_execute": lambda **kw: run_python_execute(kw["code"]),
+    "python_execute": lambda **kw: run_python_execute(
+        kw["code"], kw.get("timeout", PYEXEC_DEFAULT_TIMEOUT),
+        kw.get("record_to_notebook", False), kw.get("cell_note", "")),
     "web_search": lambda **kw: run_web_search(kw["query"]),
     "read_file": lambda **kw: run_read_file(kw["path"]),
     "inspect_data": lambda **kw: run_inspect_data(kw["path"], kw.get("sample_rows", 5)),
@@ -563,6 +669,7 @@ TOOL_HANDLERS = {
     "todo_write": lambda **kw: run_todo_write(kw["todos"]),
     "list_files": lambda **kw: run_list_files(kw.get("directory", ".")),
     "task": lambda **kw: _run_task(kw["prompt"]),
+    "parallel_tasks": lambda **kw: _run_parallel_tasks(kw["prompts"]),
 }
 
 
@@ -570,6 +677,12 @@ def _run_task(prompt: str) -> str:
     """task 工具的 handler，延迟导入避免循环引用。"""
     from agent import run_subagent
     return run_subagent(prompt)
+
+
+def _run_parallel_tasks(prompts: list) -> str:
+    """parallel_tasks 工具的 handler，延迟导入避免循环引用。"""
+    from agent import run_parallel_subagents
+    return run_parallel_subagents(prompts)
 
 
 def dispatch(name: str, arguments: str) -> str:
