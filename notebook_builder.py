@@ -41,34 +41,6 @@ class NotebookBuilder:
             cell["outputs"] = []
         return cell
 
-    @classmethod
-    def load(cls, path: str) -> "NotebookBuilder":
-        """从已有的 .ipynb 文件恢复 builder，使后续 cell 追加而非覆盖。
-
-        进程重启（续做模式）时调用，避免第一次 save() 把上次运行积累的
-        cell 全部冲掉。文件不存在或解析失败时返回一个全新 builder。
-        """
-        p = Path(path)
-        if not p.exists():
-            return cls()
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return cls()
-
-        builder = cls.__new__(cls)
-        builder.notebook = data
-        builder.notebook.setdefault("cells", [])
-        existing_counts = [
-            c.get("execution_count") or 0
-            for c in builder.notebook["cells"]
-            if c.get("cell_type") == "code"
-        ]
-        builder._cell_counter = max(
-            [len(builder.notebook["cells"])] + existing_counts
-        )
-        return builder
-
     def add_code_cell(self, source: str) -> int:
         cell = self._make_cell("code", source)
         self.notebook["cells"].append(cell)
@@ -98,6 +70,35 @@ class NotebookBuilder:
 
     def get_cell_count(self) -> int:
         return len(self.notebook["cells"])
+
+    @classmethod
+    def load(cls, path: str) -> "NotebookBuilder":
+        """从已有的 .ipynb 文件恢复 builder，使后续 cell 追加而非覆盖。
+
+        进程重启（续做模式）时调用，避免第一次 save() 把上次运行积累的
+        cell 全部冲掉。文件不存在或解析失败时返回一个全新 builder。
+        """
+        p = Path(path)
+        if not p.exists():
+            return cls()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return cls()
+
+        builder = cls.__new__(cls)
+        builder.notebook = data
+        builder.notebook.setdefault("cells", [])
+        # _cell_counter 至少为已有 cell 数，保证新 execution_count 不回退
+        existing_counts = [
+            c.get("execution_count") or 0
+            for c in builder.notebook["cells"]
+            if c.get("cell_type") == "code"
+        ]
+        builder._cell_counter = max(
+            [len(builder.notebook["cells"])] + existing_counts
+        )
+        return builder
 
     def save(self, path: str) -> str:
         p = Path(path)

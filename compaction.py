@@ -180,12 +180,14 @@ def compact_history(messages: list, client, model: str) -> list:
     )
     summary = response.choices[0].message.content or "(空摘要)"
 
+    # 输出摘要让用户可见
     print("\n" + "=" * 50)
     print("  [上下文压缩] 以下是当前进度摘要：")
     print("-" * 50)
     print(summary)
     print("=" * 50 + "\n")
 
+    # 压缩后重新注入当前 todo 状态，防止 agent 遗忘进度
     result = [{"role": "user", "content": f"[上下文已压缩]\n\n{summary}"}]
     todo_state = _get_current_todo_text()
     if todo_state:
@@ -215,6 +217,7 @@ def reactive_compact(messages: list, client, model: str) -> list:
     )
     summary = response.choices[0].message.content or "(空摘要)"
 
+    # 输出摘要让用户可见
     print("\n" + "=" * 50)
     print("  [紧急压缩] 上下文超限，以下是保留的摘要：")
     print("-" * 50)
@@ -222,6 +225,7 @@ def reactive_compact(messages: list, client, model: str) -> list:
     print("=" * 50 + "\n")
 
     tail_start = max(0, len(messages) - 6)
+    # 配对保护
     if tail_start > 0 and _is_tool_message(messages[tail_start]):
         tail_start -= 1
 

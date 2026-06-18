@@ -417,7 +417,28 @@ def agent_loop(messages: list):
                 rounds_since_todo = 0
                 save_todo()
 
-    print("\n[警告] 达到最大轮次限制，Agent 停止。")
+    # ── 达到轮次限制：保存 todo 并输出续做指引 ──
+    print("\n" + "=" * 50)
+    print(f"  [轮次用尽] Agent 已执行 {max_turns} 轮，本次暂停。")
+    print("=" * 50)
+
+    from tools import CURRENT_TODOS
+    if CURRENT_TODOS:
+        save_todo()
+        print("\n当前任务进度（已保存，下次执行将自动续做）：")
+        icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        for t in CURRENT_TODOS:
+            print(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
+        pending = [t for t in CURRENT_TODOS if t["status"] != "completed"]
+        if pending:
+            print(f"\n下次执行时 Agent 将从以下任务继续：")
+            for t in pending:
+                print(f"  → {t['content']}")
+    else:
+        print("\n[注意] Agent 没有留下任务列表，下次执行将重新开始。")
+
+    print(f"\n重新运行 python agent.py 即可继续。")
+    print("=" * 50)
 
 
 # ═══════════════════════════════════════════════════════════
